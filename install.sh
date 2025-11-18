@@ -14,7 +14,7 @@ cd /opt/gensyn-agent
 # Download latest agent code
 curl -sO https://raw.githubusercontent.com/Kaushalvasoya2001/gensyn-node-agent/main/agent.py
 
-# Create and activate virtual environment
+# Create and use a virtual environment (avoids PEP 668)
 python3 -m venv .venv
 /opt/gensyn-agent/.venv/bin/pip install --upgrade pip
 /opt/gensyn-agent/.venv/bin/pip install fastapi "uvicorn[standard]" psutil pynvml
