@@ -1,12 +1,31 @@
+#!/usr/bin/env python3
+"""
+log_watcher.py
+Sidecar that tails rl-swarm logs and writes JSON summary to /opt/gensyn-agent/detailed.json
+Non-invasive: only reads logs.
+"""
+
 import time
 import json
 import re
 import os
+from pathlib import Path
+from collections import deque
 
-LOG_DIR = "/home/user/rl-swarm/logs"   # default path (your VPS used this)
+# --- Config ---
+LOG_DIRS = [
+    "/home/user/rl-swarm/logs",
+    "/home/ubuntu/rl-swarm/logs",
+    "/var/log/rl-swarm",
+    "/opt/rl-swarm/logs",
+]
+POLL_INTERVAL = 1.0
 OUTPUT_FILE = "/opt/gensyn-agent/detailed.json"
+SAMPLES_MAX = 200
 
-latest = {
+# --- State ---
+examples_samples = deque(maxlen=SAMPLES_MAX)
+state = {
     "current_round": None,
     "latest_start_round": None,
     "map_percent": None,
@@ -15,78 +34,129 @@ latest = {
     "sample_count_examples_s": 0,
     "proofs_ok": 0,
     "proofs_fail": 0,
-    "rounds_completed": 0
+    "rounds_completed": 0,
+    "last_updated": int(time.time()),
+    "files_tracked": []
 }
 
-round_times = []
-examples_rates = []
+# regexes (tune if needed)
+RE_START = re.compile(r"Starting round[:\s]+(\d+)", re.I)
+RE_JOIN = re.compile(r"Joining round[:\s]+(\d+)", re.I)
+RE_MAP = re.compile(r"Map[:\s]+(\d+)\s*%", re.I)
+RE_EXS = re.compile(r"(\d+(?:\.\d+)?)\s*examples\/s", re.I)
+RE_OK = re.compile(r"(proof accepted|proof ok|proof result: True)", re.I)
+RE_FAIL = re.compile(r"(proof failed|proof result: False|error|failed)", re.I)
 
-def parse_line(line):
-    """Parse one log line from rl-swarm."""
-    global latest, examples_rates, round_times
+def discover_log_files(limit=6):
+    files = []
+    for d in LOG_DIRS:
+        try:
+            p = Path(d)
+            if p.is_dir():
+                found = sorted(p.glob("*.log"), key=lambda f: f.stat().st_mtime, reverse=True)
+                for f in found:
+                    files.append(f)
+                    if len(files) >= limit:
+                        return files
+            elif p.is_file():
+                files.append(p)
+        except Exception:
+            continue
+    # fallback: search /home/*/rl-swarm/logs
+    base = Path("/home")
+    if base.exists():
+        for u in base.iterdir():
+            candidate = u / "rl-swarm" / "logs"
+            if candidate.exists() and candidate.is_dir():
+                for f in sorted(candidate.glob("*.log"), key=lambda x: x.stat().st_mtime, reverse=True):
+                    files.append(f)
+                    if len(files) >= limit:
+                        return files
+    return files
 
-    # Round start
-    m = re.search(r"Starting round: (\d+)", line)
-    if m:
-        r = int(m.group(1))
-        latest["current_round"] = r
-        latest["latest_start_round"] = r
-        return
+def tail_file(path, last_pos):
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            if size <= last_pos.get(path, 0):
+                return "", size
+            start = last_pos.get(path, 0)
+            fh.seek(start)
+            data = fh.read().decode(errors="ignore")
+            return data, fh.tell()
+    except Exception:
+        return "", last_pos.get(path, 0)
 
-    # Map %
-    m = re.search(r"Map: (\d+)%", line)
-    if m:
-        latest["map_percent"] = int(m.group(1))
-        return
-
-    # Examples/s metric
-    m = re.search(r"\[(\d+\.\d+) examples/s\]", line)
-    if m:
-        val = float(m.group(1))
-        latest["examples_s_latest"] = val
-        examples_rates.append(val)
-        if len(examples_rates) > 20:
-            examples_rates.pop(0)
-        latest["examples_s_avg"] = round(sum(examples_rates) / len(examples_rates), 2)
-        return
-
-    # Proof success/fail
-    if "proof result: True" in line or "proof ok" in line.lower():
-        latest["proofs_ok"] += 1
-        latest["rounds_completed"] += 1
-
-    if "proof result: False" in line or "failed proof" in line.lower():
-        latest["proofs_fail"] += 1
-        latest["rounds_completed"] += 1
-
-
-def write_output():
-    with open(OUTPUT_FILE, "w") as f:
-        json.dump(latest, f)
-
-
-def follow_logs():
-    """Attach to all log files in rl-swarm/logs and track updates."""
-    print("🔄 Watching RL-SWARM logs...")
-
-    while True:
-        if not os.path.exists(LOG_DIR):
-            time.sleep(2)
+def parse_lines(lines):
+    changed = False
+    for line in lines:
+        line = line.strip()
+        if not line:
             continue
 
-        files = [os.path.join(LOG_DIR, f) for f in os.listdir(LOG_DIR) if f.endswith(".log")]
+        m = RE_JOIN.search(line)
+        if m:
+            state["current_round"] = int(m.group(1))
+            changed = True
 
-        for file in files:
+        m = RE_START.search(line)
+        if m:
+            state["latest_start_round"] = int(m.group(1))
+            changed = True
+
+        m = RE_MAP.search(line)
+        if m:
+            state["map_percent"] = int(m.group(1))
+            changed = True
+
+        m = RE_EXS.search(line)
+        if m:
             try:
-                with open(file, "r") as f:
-                    for line in f:
-                        parse_line(line)
+                v = float(m.group(1))
+                examples_samples.append(v)
+                state["examples_s_latest"] = round(v, 2)
+                if examples_samples:
+                    state["examples_s_avg"] = round(sum(examples_samples) / len(examples_samples), 2)
+                state["sample_count_examples_s"] = len(examples_samples)
+                changed = True
             except:
                 pass
 
-        write_output()
-        time.sleep(2)
+        if RE_OK.search(line):
+            state["proofs_ok"] += 1
+            state["rounds_completed"] += 1
+            changed = True
 
+        if RE_FAIL.search(line):
+            state["proofs_fail"] += 1
+            changed = True
+
+    if changed:
+        state["last_updated"] = int(time.time())
+    return changed
+
+def write_output():
+    try:
+        os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
+        with open(OUTPUT_FILE, "w") as fh:
+            json.dump(state, fh, indent=None)
+    except Exception:
+        pass
+
+def main_loop():
+    last_pos = {}
+    while True:
+        files = discover_log_files(limit=8)
+        state["files_tracked"] = [str(p) for p in files]
+        for f in files:
+            data, pos = tail_file(str(f), last_pos)
+            last_pos[str(f)] = pos
+            if data:
+                lines = data.splitlines()
+                parse_lines(lines)
+        write_output()
+        time.sleep(POLL_INTERVAL)
 
 if __name__ == "__main__":
-    follow_logs()
+    main_loop()
