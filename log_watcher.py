@@ -18,6 +18,7 @@ LOG_DIRS = [
     "/home/ubuntu/rl-swarm/logs",
     "/var/log/rl-swarm",
     "/opt/rl-swarm/logs",
+    "/root/rl-swarm/logs",  # commonly found on some setups
 ]
 POLL_INTERVAL = 1.0
 OUTPUT_FILE = "/opt/gensyn-agent/detailed.json"
@@ -43,35 +44,44 @@ state = {
 RE_START = re.compile(r"Starting round[:\s]+(\d+)", re.I)
 RE_JOIN = re.compile(r"Joining round[:\s]+(\d+)", re.I)
 RE_MAP = re.compile(r"Map[:\s]+(\d+)\s*%", re.I)
+
+# original pattern and extra permissive patterns for examples/sec
 RE_EXS = re.compile(r"(\d+(?:\.\d+)?)\s*examples\/s", re.I)
-RE_OK = re.compile(r"(proof accepted|proof ok|proof result: True)", re.I)
-RE_FAIL = re.compile(r"(proof failed|proof result: False|error|failed)", re.I)
+RE_EXS_2 = re.compile(r"examples[_\s\/-]*s[:\s]*([0-9]+(?:\.[0-9]+)?)", re.I)
+RE_EXS_3 = re.compile(r"(?:ex\/s|exs|examples_per_s)[:\s]*([0-9]+(?:\.[0-9]+)?)", re.I)
+
+RE_OK = re.compile(r"(proof accepted|proof ok|proof result[:\s]*True|Proof accepted)", re.I)
+RE_FAIL = re.compile(r"(proof failed|proof result[:\s]*False|job failed|error|failed)", re.I)
 
 def discover_log_files(limit=6):
     files = []
     for d in LOG_DIRS:
         try:
             p = Path(d)
-            if p.is_dir():
-                found = sorted(p.glob("*.log"), key=lambda f: f.stat().st_mtime, reverse=True)
+            if p.exists():
+                # recursive search so we pick logs inside subfolders (wandb etc.)
+                found = sorted(p.rglob("*.log"), key=lambda f: f.stat().st_mtime, reverse=True)
                 for f in found:
                     files.append(f)
                     if len(files) >= limit:
                         return files
-            elif p.is_file():
-                files.append(p)
         except Exception:
             continue
+
     # fallback: search /home/*/rl-swarm/logs
     base = Path("/home")
     if base.exists():
-        for u in base.iterdir():
-            candidate = u / "rl-swarm" / "logs"
-            if candidate.exists() and candidate.is_dir():
-                for f in sorted(candidate.glob("*.log"), key=lambda x: x.stat().st_mtime, reverse=True):
-                    files.append(f)
-                    if len(files) >= limit:
-                        return files
+        try:
+            for u in base.iterdir():
+                candidate = u / "rl-swarm" / "logs"
+                if candidate.exists() and candidate.is_dir():
+                    for f in sorted(candidate.rglob("*.log"), key=lambda x: x.stat().st_mtime, reverse=True):
+                        files.append(f)
+                        if len(files) >= limit:
+                            return files
+        except Exception:
+            pass
+
     return files
 
 def tail_file(path, last_pos):
@@ -79,10 +89,15 @@ def tail_file(path, last_pos):
         with open(path, "rb") as fh:
             fh.seek(0, os.SEEK_END)
             size = fh.tell()
-            if size <= last_pos.get(path, 0):
+            last = last_pos.get(path, None)
+            # If we've never seen this file, read the last chunk only (don't parse entire huge logs)
+            if last is None:
+                read_from = max(0, size - 64_000)
+            else:
+                read_from = last
+            if size <= read_from:
                 return "", size
-            start = last_pos.get(path, 0)
-            fh.seek(start)
+            fh.seek(read_from)
             data = fh.read().decode(errors="ignore")
             return data, fh.tell()
     except Exception:
@@ -97,20 +112,30 @@ def parse_lines(lines):
 
         m = RE_JOIN.search(line)
         if m:
-            state["current_round"] = int(m.group(1))
-            changed = True
+            try:
+                state["current_round"] = int(m.group(1))
+                changed = True
+            except:
+                pass
 
         m = RE_START.search(line)
         if m:
-            state["latest_start_round"] = int(m.group(1))
-            changed = True
+            try:
+                state["latest_start_round"] = int(m.group(1))
+                changed = True
+            except:
+                pass
 
         m = RE_MAP.search(line)
         if m:
-            state["map_percent"] = int(m.group(1))
-            changed = True
+            try:
+                state["map_percent"] = int(m.group(1))
+                changed = True
+            except:
+                pass
 
-        m = RE_EXS.search(line)
+        # check multiple examples patterns
+        m = RE_EXS.search(line) or RE_EXS_2.search(line) or RE_EXS_3.search(line)
         if m:
             try:
                 v = float(m.group(1))
@@ -139,8 +164,9 @@ def parse_lines(lines):
 def write_output():
     try:
         os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
+        # ensure stable JSON output
         with open(OUTPUT_FILE, "w") as fh:
-            json.dump(state, fh, indent=None)
+            json.dump(state, fh)
     except Exception:
         pass
 
