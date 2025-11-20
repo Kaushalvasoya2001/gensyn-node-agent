@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 # agent.py — merged metrics + detailed endpoint (use as /opt/gensyn-agent/agent.py)
-import time, os, json
+import time
+import os
+import json
+import glob
+import re
 from typing import Any, Dict
 from fastapi import FastAPI, Request, Query
 from fastapi.responses import JSONResponse
@@ -24,7 +28,7 @@ def gpu_data():
             mem = pynvml.nvmlDeviceGetMemoryInfo(h)
             util = pynvml.nvmlDeviceGetUtilizationRates(h)
             out.append({
-                "name": pynvml.nvmlDeviceGetName(h).decode(),
+                "name": pynvml.nvmlDeviceGetName(h).decode() if hasattr(pynvml.nvmlDeviceGetName(h), "decode") else str(pynvml.nvmlDeviceGetName(h)),
                 "util": int(util.gpu),
                 "used_gb": round(mem.used/1e9,2),
                 "total_gb": round(mem.total/1e9,2)
@@ -45,18 +49,6 @@ def metrics():
         "gpu": gpu_data()
     }
 
-# helper to check token if set
-def check_token(req: Request, require: str|None):
-    if REQUIRE_TOKEN:
-        # token can be passed as query param 'require_token' or header 'x-api-token'
-        token_q = req.query_params.get("require_token") or req.query_params.get("token")
-        header = req.headers.get("x-api-token") or req.headers.get("authorization")
-        if token_q == REQUIRE_TOKEN or header == REQUIRE_TOKEN:
-            return True
-        else:
-            return False
-    return True
-
 # Attempt 1: ask local sidecar HTTP port (if present)
 def fetch_sidecar():
     import requests
@@ -64,9 +56,12 @@ def fetch_sidecar():
         r = requests.get("http://127.0.0.1:9106/watch-metrics", timeout=1.2)
         if r.ok:
             j = r.json()
-            return j.get("data") if isinstance(j, dict) and j.get("ok") else None
+            # expecting { "ok": True, "data": { ... } }
+            if isinstance(j, dict) and j.get("ok"):
+                return j.get("data")
     except Exception:
-        return None
+        pass
+    return None
 
 # Attempt 2: read JSON written by the log watcher sidecar
 def read_sidecar_file():
@@ -76,35 +71,37 @@ def read_sidecar_file():
             with open(fn, "r") as fh:
                 return json.load(fh)
     except Exception:
-        return None
+        pass
     return None
 
 @app.get("/detailed-metrics")
 async def detailed(request: Request, require_token: str|None = Query(None)):
     # token check (use require_token query for external calls)
-    if REQUIRE_TOKEN and require_token != REQUIRE_TOKEN and request.headers.get("x-api-token") != REQUIRE_TOKEN:
-        return JSONResponse({"ok": False, "error": "invalid token"}, status_code=401)
+    if REQUIRE_TOKEN:
+        token_q = require_token or request.query_params.get("token") or request.query_params.get("require_token")
+        header = request.headers.get("x-api-token") or request.headers.get("authorization")
+        if token_q != REQUIRE_TOKEN and header != REQUIRE_TOKEN:
+            return JSONResponse({"ok": False, "error": "invalid token"}, status_code=401)
 
     # base metrics
     base = metrics()
 
     # try local sidecar HTTP first (fast)
     side = fetch_sidecar()
-    if side:
-        merged = {"detailed": side}
-        merged.update(base)
-        merged["ok"] = True
+    if side and isinstance(side, dict):
+        # flatten: put side (detailed fields) into the top-level data object
+        merged = base.copy()
+        merged.update(side)
         return JSONResponse({"ok": True, "data": merged})
 
-    # try sidecar JSON file (quick and reliable)
-    sidefile = read_sidecar_file()
-    if sidefile:
-        merged = {"detailed": sidefile}
-        merged.update(base)
-        merged["ok"] = True
+    # try sidecar JSON file
+    sfile = read_sidecar_file()
+    if sfile and isinstance(sfile, dict):
+        merged = base.copy()
+        merged.update(sfile)
         return JSONResponse({"ok": True, "data": merged})
 
-    # fallback — try to parse common log paths quickly (non-blocking, minimal)
+    # fallback — quick log scan (non-blocking, minimal)
     detailed = {
         "current_round": None,
         "latest_start_round": None,
@@ -122,17 +119,14 @@ async def detailed(request: Request, require_token: str|None = Query(None)):
         "/home/ubuntu/rl-swarm/logs",
         "/var/log/rl-swarm",
         "/opt/rl-swarm/logs",
+        "/root/rl-swarm/logs"
     ]
-    # quick scan: read latest few lines of any *.log found and attempt lightweight parse
-    import glob
-    import re
+
     RE_JOIN = re.compile(r"Joining round[:\s]+(\d+)", re.I)
     RE_START = re.compile(r"Starting round[:\s]+(\d+)", re.I)
     RE_EXS = re.compile(r"(\d+(?:\.\d+)?)\s*examples\/s", re.I)
-    # extra permissive examples pattern
-    RE_EXS_2 = re.compile(r"examples[_\s\/-]*s[:\s]*([0-9]+(?:\.[0-9]+)?)", re.I)
-    RE_OK = re.compile(r"(proof accepted|proof ok|proof result: True)", re.I)
-    RE_FAIL = re.compile(r"(proof failed|proof result: False|job failed|error|failed)", re.I)
+    RE_OK = re.compile(r"(proof accepted|proof ok|Proof accepted|Proof ok|proof result: True)", re.I)
+    RE_FAIL = re.compile(r"(proof failed|Proof failed|job failed|error|proof result: False)", re.I)
 
     for p in LOG_CANDIDATES:
         try:
@@ -157,14 +151,15 @@ async def detailed(request: Request, require_token: str|None = Query(None)):
                 m = RE_START.search(line)
                 if m and not detailed["latest_start_round"]:
                     detailed["latest_start_round"] = int(m.group(1))
-                m = RE_EXS.search(line) or RE_EXS_2.search(line)
+                m = RE_EXS.search(line)
                 if m:
                     try:
-                        detailed["examples_s_latest"] = float(m.group(1))
-                        # naive avg: keep as latest only in fallback
-                        detailed["examples_s_avg"] = detailed.get("examples_s_avg") or detailed["examples_s_latest"]
+                        val = float(m.group(1))
+                        detailed["examples_s_latest"] = val
+                        if detailed["examples_s_avg"] is None:
+                            detailed["examples_s_avg"] = val
                         detailed["sample_count_examples_s"] += 1
-                    except:
+                    except Exception:
                         pass
                 if RE_OK.search(line):
                     detailed["proofs_ok"] += 1
@@ -173,6 +168,5 @@ async def detailed(request: Request, require_token: str|None = Query(None)):
                     detailed["proofs_fail"] += 1
 
     merged = base.copy()
-    merged["detailed"] = detailed
-    merged["ok"] = True
+    merged.update(detailed)
     return JSONResponse({"ok": True, "data": merged})
