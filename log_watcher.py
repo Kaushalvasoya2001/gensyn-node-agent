@@ -1,3 +1,4 @@
+cat > /opt/gensyn-agent/log_watcher.py <<'PY'
 #!/usr/bin/env python3
 """
 log_watcher.py
@@ -160,3 +161,5 @@ def main_loop():
 
 if __name__ == "__main__":
     main_loop()
+PY
+chmod 755 /opt/gensyn-agent/log_watcher.py
