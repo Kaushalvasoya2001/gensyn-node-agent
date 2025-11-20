@@ -1,4 +1,3 @@
-cat > /opt/gensyn-agent/install.sh <<'SH'
 #!/bin/bash
 set -euo pipefail
 echo "🚀 Installing Gensyn Node Agent..."
@@ -17,7 +16,7 @@ UVICORN_CMD="$VENV_DIR/bin/uvicorn"
 
 # ---- 1) Install system packages (idempotent) ----
 apt update -y || true
-DEPS="python3 python3-venv python3-pip curl jq"
+DEPS="python3 python3-venv python3-pip curl"
 apt install -y $DEPS
 
 # ---- 2) Create install dir and download agent files ----
@@ -26,7 +25,7 @@ cd "$INSTALL_DIR"
 
 echo "Downloading agent files from repository..."
 curl -fsSL "$REPO_RAW_BASE/$AGENT_PY" -o agent.py || { echo "Failed to download agent.py"; exit 1; }
-# optional watcher
+# try to download the watcher; it is optional (the agent will still run without it)
 curl -fsSL "$REPO_RAW_BASE/$LOG_AGENT_PY" -o log_watcher.py || echo "log_watcher.py not found in repo (optional) - continuing"
 
 # ---- 3) Create venv and install python deps inside it ----
@@ -65,7 +64,7 @@ WantedBy=multi-user.target
 EOF
 
 # ---- 6) (Optional) Create systemd service for log watcher if log_watcher.py exists ----
-if [ -f "$INSTALL_DIR/log_watcher.py" ]; then
+if [ -f "$INSTALL_DIR/$LOG_AGENT_PY" ]; then
   cat <<'EOF' >/etc/systemd/system/gensyn-log-watcher.service
 [Unit]
 Description=Gensyn Log Watcher
@@ -73,7 +72,6 @@ After=network.target
 
 [Service]
 WorkingDirectory=/opt/gensyn-agent
-# uses system python to avoid additional venv complexity for the watcher
 ExecStart=/usr/bin/python3 /opt/gensyn-agent/log_watcher.py
 Restart=always
 RestartSec=5
@@ -84,7 +82,7 @@ User=root
 [Install]
 WantedBy=multi-user.target
 EOF
-  echo "Created gensyn-log-watcher.service (will be enabled)."
+  echo "Created gensyn-log-watcher.service (disabled by default). It will be enabled below."
 fi
 
 # ---- 7) Enable & start services ----
@@ -104,12 +102,10 @@ fi
 echo "🎯 DONE — Gensyn Node Agent installed and running (port 9105)."
 echo "Test endpoints:"
 echo " - Basic metrics: curl http://<YOUR_IP>:9105/metrics"
-echo " - Detailed metrics (if logs/watcher present): curl http://<YOUR_IP>:9105/detailed-metrics"
+echo " - Detailed metrics (if logs found or watcher running): curl http://<YOUR_IP>:9105/detailed-metrics"
 echo ""
 echo "If you want token protection for /detailed-metrics:"
 echo "  sudo systemctl edit $SERVICE_NAME"
 echo "  # add in the [Service] section e.g.:"
 echo "  # Environment=\"GENSYN_API_TOKEN=your-secret-token\""
 echo "  sudo systemctl daemon-reload && sudo systemctl restart $SERVICE_NAME"
-SH
-chmod 755 /opt/gensyn-agent/install.sh
