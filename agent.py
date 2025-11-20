@@ -97,12 +97,20 @@ async def detailed(request: Request, require_token: str|None = Query(None)):
         return JSONResponse({"ok": True, "data": merged})
 
     # try sidecar JSON file
-    sidefile = read_sidecar_file()
-    if sidefile:
-        merged = {"detailed": sidefile}
-        merged.update(base)
-        merged["ok"] = True
-        return JSONResponse({"ok": True, "data": merged})
+    # quick sidecar file read: prefer /opt/gensyn-agent/detailed.json when available
+SIDE_JSON = "/opt/gensyn-agent/detailed.json"
+if os.path.exists(SIDE_JSON):
+    try:
+        with open(SIDE_JSON, "r") as fh:
+            sdata = json.load(fh)
+            # merge into base structure: sdata already contains the detailed fields
+            merged = base.copy()
+            merged["detailed"] = sdata
+            merged["ok"] = True
+            return JSONResponse({"ok": True, "data": merged})
+    except Exception:
+        pass
+
 
     # fallback — try to parse common log paths quickly (non-blocking, minimal)
     detailed = {
