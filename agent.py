@@ -1,3 +1,4 @@
+cat > /opt/gensyn-agent/agent.py <<'PY'
 #!/usr/bin/env python3
 # agent.py — merged metrics + detailed endpoint (use as /opt/gensyn-agent/agent.py)
 import time, os, json
@@ -57,8 +58,8 @@ def check_token(req: Request, require: str|None):
             return False
     return True
 
-# Attempt 1: ask local sidecar
-def fetch_sidecar():
+# Attempt 1: ask local sidecar via HTTP (if you want, sidecar can expose 9106)
+def fetch_sidecar_http():
     import requests
     try:
         r = requests.get("http://127.0.0.1:9106/watch-metrics", timeout=1.2)
@@ -67,6 +68,17 @@ def fetch_sidecar():
             return j.get("data") if isinstance(j, dict) and j.get("ok") else None
     except Exception:
         return None
+
+# Better: read the JSON file produced by log_watcher if present
+def read_sidecar_file():
+    fn = "/opt/gensyn-agent/detailed.json"
+    try:
+        if os.path.exists(fn):
+            with open(fn) as fh:
+                return json.load(fh)
+    except Exception:
+        return None
+    return None
 
 @app.get("/detailed-metrics")
 async def detailed(request: Request, require_token: str|None = Query(None)):
@@ -77,17 +89,23 @@ async def detailed(request: Request, require_token: str|None = Query(None)):
     # base metrics
     base = metrics()
 
-    # try sidecar first (fast)
-    side = fetch_sidecar()
+    # try sidecar file first (fast, reliable)
+    side = read_sidecar_file()
     if side:
-        # sidecar already returns fields like examples_s_latest, proofs_ok, etc.
-        merged = {"detailed": side}
-        merged.update(base)
+        merged = base.copy()
+        merged["detailed"] = side
         merged["ok"] = True
         return JSONResponse({"ok": True, "data": merged})
 
-    # fallback — try to parse common log paths quickly (non-blocking, minimal)
-    # look for logs under /home/*/rl-swarm/logs or /var/log/rl-swarm
+    # fallback: try HTTP sidecar
+    side = fetch_sidecar_http()
+    if side:
+        merged = base.copy()
+        merged["detailed"] = side
+        merged["ok"] = True
+        return JSONResponse({"ok": True, "data": merged})
+
+    # fallback — quick log-scan (non-blocking, minimal)
     detailed = {
         "current_round": None,
         "latest_start_round": None,
@@ -112,7 +130,7 @@ async def detailed(request: Request, require_token: str|None = Query(None)):
     RE_JOIN = re.compile(r"Joining round[:\s]+(\d+)", re.I)
     RE_START = re.compile(r"Starting round[:\s]+(\d+)", re.I)
     RE_EXS = re.compile(r"(\d+(?:\.\d+)?)\s*examples\/s", re.I)
-    RE_OK = re.compile(r"(proof accepted|Proof accepted|Proof accepted)", re.I)
+    RE_OK = re.compile(r"(proof accepted|proof ok|Proof accepted)", re.I)
     RE_FAIL = re.compile(r"(proof failed|Proof failed|job failed|error)", re.I)
 
     for p in LOG_CANDIDATES:
@@ -142,7 +160,6 @@ async def detailed(request: Request, require_token: str|None = Query(None)):
                 if m:
                     try:
                         detailed["examples_s_latest"] = float(m.group(1))
-                        # naive avg: keep as latest only in fallback
                         detailed["examples_s_avg"] = detailed.get("examples_s_avg") or detailed["examples_s_latest"]
                         detailed["sample_count_examples_s"] += 1
                     except:
@@ -157,3 +174,5 @@ async def detailed(request: Request, require_token: str|None = Query(None)):
     merged["detailed"] = detailed
     merged["ok"] = True
     return JSONResponse({"ok": True, "data": merged})
+PY
+chmod 644 /opt/gensyn-agent/agent.py
