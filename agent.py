@@ -96,21 +96,13 @@ async def detailed(request: Request, require_token: str|None = Query(None)):
         merged["ok"] = True
         return JSONResponse({"ok": True, "data": merged})
 
-    # try sidecar JSON file
-    # quick sidecar file read: prefer /opt/gensyn-agent/detailed.json when available
-SIDE_JSON = "/opt/gensyn-agent/detailed.json"
-if os.path.exists(SIDE_JSON):
-    try:
-        with open(SIDE_JSON, "r") as fh:
-            sdata = json.load(fh)
-            # merge into base structure: sdata already contains the detailed fields
-            merged = base.copy()
-            merged["detailed"] = sdata
-            merged["ok"] = True
-            return JSONResponse({"ok": True, "data": merged})
-    except Exception:
-        pass
-
+    # try sidecar JSON file (quick and reliable)
+    sidefile = read_sidecar_file()
+    if sidefile:
+        merged = {"detailed": sidefile}
+        merged.update(base)
+        merged["ok"] = True
+        return JSONResponse({"ok": True, "data": merged})
 
     # fallback — try to parse common log paths quickly (non-blocking, minimal)
     detailed = {
@@ -137,8 +129,10 @@ if os.path.exists(SIDE_JSON):
     RE_JOIN = re.compile(r"Joining round[:\s]+(\d+)", re.I)
     RE_START = re.compile(r"Starting round[:\s]+(\d+)", re.I)
     RE_EXS = re.compile(r"(\d+(?:\.\d+)?)\s*examples\/s", re.I)
-    RE_OK = re.compile(r"(proof accepted|Proof accepted|Proof accepted)", re.I)
-    RE_FAIL = re.compile(r"(proof failed|Proof failed|job failed|error)", re.I)
+    # extra permissive examples pattern
+    RE_EXS_2 = re.compile(r"examples[_\s\/-]*s[:\s]*([0-9]+(?:\.[0-9]+)?)", re.I)
+    RE_OK = re.compile(r"(proof accepted|proof ok|proof result: True)", re.I)
+    RE_FAIL = re.compile(r"(proof failed|proof result: False|job failed|error|failed)", re.I)
 
     for p in LOG_CANDIDATES:
         try:
@@ -163,7 +157,7 @@ if os.path.exists(SIDE_JSON):
                 m = RE_START.search(line)
                 if m and not detailed["latest_start_round"]:
                     detailed["latest_start_round"] = int(m.group(1))
-                m = RE_EXS.search(line)
+                m = RE_EXS.search(line) or RE_EXS_2.search(line)
                 if m:
                     try:
                         detailed["examples_s_latest"] = float(m.group(1))
