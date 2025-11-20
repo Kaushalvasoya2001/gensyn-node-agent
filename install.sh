@@ -1,3 +1,4 @@
+cat > /opt/gensyn-agent/install.sh <<'SH'
 #!/bin/bash
 set -euo pipefail
 echo "🚀 Installing Gensyn Node Agent..."
@@ -5,7 +6,7 @@ echo "🚀 Installing Gensyn Node Agent..."
 # ---- Config (edit here if installing manually) ----
 REPO_RAW_BASE="https://raw.githubusercontent.com/Kaushalvasoya2001/gensyn-node-agent/main"
 AGENT_PY="agent.py"
-LOG_AGENT_PY="log_agent.py"   # optional - posts parsed events to analytics server
+LOG_AGENT_PY="log_watcher.py"
 INSTALL_DIR="/opt/gensyn-agent"
 VENV_DIR="$INSTALL_DIR/.venv"
 SERVICE_NAME="gensyn-agent"
@@ -16,7 +17,7 @@ UVICORN_CMD="$VENV_DIR/bin/uvicorn"
 
 # ---- 1) Install system packages (idempotent) ----
 apt update -y || true
-DEPS="python3 python3-venv python3-pip curl"
+DEPS="python3 python3-venv python3-pip curl jq"
 apt install -y $DEPS
 
 # ---- 2) Create install dir and download agent files ----
@@ -25,16 +26,14 @@ cd "$INSTALL_DIR"
 
 echo "Downloading agent files from repository..."
 curl -fsSL "$REPO_RAW_BASE/$AGENT_PY" -o agent.py || { echo "Failed to download agent.py"; exit 1; }
-
-# optional: log watcher that tails rl-swarm logs and posts events to analytics server
-# will only be enabled if the systemd service for it is created (below).
-curl -fsSL "$REPO_RAW_BASE/$LOG_AGENT_PY" -o log_agent.py || echo "log_agent.py not found in repo (optional) - continuing"
+# optional watcher
+curl -fsSL "$REPO_RAW_BASE/$LOG_AGENT_PY" -o log_watcher.py || echo "log_watcher.py not found in repo (optional) - continuing"
 
 # ---- 3) Create venv and install python deps inside it ----
 python3 -m venv "$VENV_DIR"
 # ensure pip is available
 "$VENV_DIR/bin/python" -m pip install --upgrade pip setuptools wheel
-"$VENV_DIR/bin/pip" install fastapi "uvicorn[standard]" psutil pynvml requests tailer || true
+"$VENV_DIR/bin/pip" install fastapi "uvicorn[standard]" psutil pynvml requests || true
 
 # ---- 4) Create log files and set permissions ----
 mkdir -p /var/log
@@ -44,9 +43,6 @@ chmod 755 "$INSTALL_DIR"
 chmod 644 /var/log/gensyn-agent*.log
 
 # ---- 5) Create systemd service for the API agent ----
-# This service will read optional env vars if you set them:
-# - GENSYN_API_TOKEN (simple auth for detailed endpoint)
-# - GENSYN_ANALYTICS_SERVER (URL to forward parsed events)
 cat <<EOF >/etc/systemd/system/$SERVICE_NAME.service
 [Unit]
 Description=Gensyn Node Agent
@@ -68,8 +64,8 @@ User=root
 WantedBy=multi-user.target
 EOF
 
-# ---- 6) (Optional) Create systemd service for log watcher if log_agent.py exists ----
-if [ -f "$INSTALL_DIR/$LOG_AGENT_PY" ]; then
+# ---- 6) (Optional) Create systemd service for log watcher if log_watcher.py exists ----
+if [ -f "$INSTALL_DIR/log_watcher.py" ]; then
   cat <<'EOF' >/etc/systemd/system/gensyn-log-watcher.service
 [Unit]
 Description=Gensyn Log Watcher
@@ -78,7 +74,7 @@ After=network.target
 [Service]
 WorkingDirectory=/opt/gensyn-agent
 # uses system python to avoid additional venv complexity for the watcher
-ExecStart=/usr/bin/python3 /opt/gensyn-agent/log_agent.py
+ExecStart=/usr/bin/python3 /opt/gensyn-agent/log_watcher.py
 Restart=always
 RestartSec=5
 StandardOutput=append:/var/log/gensyn-agent.log
@@ -88,7 +84,7 @@ User=root
 [Install]
 WantedBy=multi-user.target
 EOF
-  echo "Created gensyn-log-watcher.service (disabled by default). It will be enabled below."
+  echo "Created gensyn-log-watcher.service (will be enabled)."
 fi
 
 # ---- 7) Enable & start services ----
@@ -108,10 +104,12 @@ fi
 echo "🎯 DONE — Gensyn Node Agent installed and running (port 9105)."
 echo "Test endpoints:"
 echo " - Basic metrics: curl http://<YOUR_IP>:9105/metrics"
-echo " - Detailed metrics (if logs found): curl http://<YOUR_IP>:9105/detailed-metrics"
+echo " - Detailed metrics (if logs/watcher present): curl http://<YOUR_IP>:9105/detailed-metrics"
 echo ""
 echo "If you want token protection for /detailed-metrics:"
 echo "  sudo systemctl edit $SERVICE_NAME"
 echo "  # add in the [Service] section e.g.:"
 echo "  # Environment=\"GENSYN_API_TOKEN=your-secret-token\""
 echo "  sudo systemctl daemon-reload && sudo systemctl restart $SERVICE_NAME"
+SH
+chmod 755 /opt/gensyn-agent/install.sh
